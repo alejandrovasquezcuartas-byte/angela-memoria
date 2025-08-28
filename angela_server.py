@@ -17,10 +17,10 @@ from firebase_admin import credentials, firestore, storage
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("angela_server")
 
-app = FastAPI(title="Angela Memoria API", version="1.2.1")
+app = FastAPI(title="Angela Memoria API", version="1.2.2")
 
 # -----------------------------
-# CORS (ajusta si quieres)
+# CORS (ajusta dominios si quieres)
 # -----------------------------
 app.add_middleware(
     CORSMiddleware,
@@ -47,7 +47,6 @@ def _init_firebase_once():
         raise RuntimeError("FIREBASE_KEY_JSON no contiene JSON válido.") from e
 
     project_id = key_dict.get("project_id")
-    # Inferimos bucket si no viene por variable:
     inferred_bucket = f"{project_id}.firebasestorage.app" if project_id else None
     bucket_name = os.getenv("FIREBASE_STORAGE_BUCKET") or inferred_bucket
     if not bucket_name:
@@ -64,17 +63,6 @@ def _db_bucket():
 @app.on_event("startup")
 def on_startup():
     _init_firebase_once()
-
-# -----------------------------
-# Endpoints base
-# -----------------------------
-@app.get("/")
-def root():
-    return {"service": "Angela Memoria API", "status": "ok"}
-
-@app.get("/health")
-def health():
-    return {"ok": True, "ts": datetime.datetime.utcnow().isoformat()}
 
 # -----------------------------
 # Utilidades
@@ -116,8 +104,16 @@ def _fmt_currency(amount: float) -> str:
         return str(amount)
 
 # -----------------------------
-# Endpoints básicos
+# Endpoints base
 # -----------------------------
+@app.get("/")
+def root():
+    return {"service": "Angela Memoria API", "status": "ok"}
+
+@app.get("/health")
+def health():
+    return {"ok": True, "ts": datetime.datetime.utcnow().isoformat()}
+
 @app.post("/guardar_memoria")
 def guardar_memoria_post(texto: str = Form(...), etiqueta: str = Form("general")):
     db, _ = _db_bucket()
@@ -147,7 +143,7 @@ async def subir_archivo_post(file: UploadFile = File(...)):
     try:
         url = _upload_bytes_to_storage(filename, data, content_type)
     except Exception as e1:
-        logger.warning(f"upload_from_string falló ({type(e1).__name__}: {e1}), usando fallback tempfile…")
+        logger.warning(f"upload_from_string falló ({type(e1).__name__}: {e1}); usando fallback tempfile…")
         try:
             url = _upload_tempfile_to_storage(filename, data, content_type)
         except Exception as e2:
@@ -173,7 +169,7 @@ WOO_UPDATE_ON_HOLD = os.getenv("WOO_UPDATE_ON_HOLD", "0")  # "1" para activar
 
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")             # token WA Cloud API (opcional)
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")       # ej: 123456789012345 (opcional)
-WHATSAPP_NOTIFY_TO = os.getenv("WHATSAPP_NOTIFY_TO")     # número destino, ej: 57xxxxxxxxxx (opcional)
+WHATSAPP_NOTIFY_TO = os.getenv("WHATSAPP_NOTIFY_TO")     # número destino en formato internacional (opcional)
 
 def _update_woocommerce_status(order_id: int, status: str = "on-hold") -> Optional[dict]:
     if not (WOO_BASE_URL and WOO_CONSUMER_KEY and WOO_CONSUMER_SECRET):
@@ -288,16 +284,18 @@ async def webhook_woocommerce(request: Request):
     doc_id = str(order_id) if order_id else firestore.AUTO_ID
     db.collection("Pedidos").document(doc_id).set(doc)
 
-    # Opcionales
+    # Acciones opcionales
     updated = None
     if WOO_UPDATE_ON_HOLD == "1" and order_id:
         updated = _update_woocommerce_status(order_id, "on-hold")
 
+    # Texto de WhatsApp (corregido sin escapes raros)
+    items_str = ", ".join([f"{i.get('name','')} x{i.get('quantity')}" for i in items]) if items else "—"
     resumen = (
         f"🧾 Nuevo pedido WooCommerce #{number}\n"
         f"Cliente: {customer_name}\n"
         f"Total: {currency} {_fmt_currency(total)}\n"
-        f"Items: " + ", ".join([f\"{i.get('name','')} x{i.get('quantity')}\" for i in items]) + "\n"
+        f"Items: {items_str}\n"
         f"Estado: {status}"
     )
     wa_resp = _send_whatsapp_message(resumen)
