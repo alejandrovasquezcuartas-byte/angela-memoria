@@ -1,114 +1,75 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from google.cloud import firestore, storage
-from google.oauth2 import service_account
-from datetime import datetime
 import os
+import json
+import datetime
+import firebase_admin
+from firebase_admin import credentials, firestore, storage
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
 
-# -------------------------------
-# CONFIGURACIÓN FIREBASE
-# -------------------------------
-credenciales = service_account.Credentials.from_service_account_file(
-    "firebase_key.json"  # Asegúrate de que este archivo esté en tu carpeta
+# ================================
+# Configuración Firebase con VAR EN RENDER
+# ================================
+firebase_key = os.getenv("FIREBASE_KEY")
+if not firebase_key:
+    raise Exception("FIREBASE_KEY no está configurada en Render")
+
+cred_dict = json.loads(firebase_key)
+cred = credentials.Certificate(cred_dict)
+
+firebase_admin.initialize_app(cred, {
+    "storageBucket": "angela-memoria.appspot.com"
+})
+
+db = firestore.client()
+bucket = storage.bucket()
+
+# ================================
+# FastAPI
+# ================================
+app = FastAPI(title="Angela Memoria API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-db = firestore.Client(credentials=credenciales, project=credenciales.project_id)
-storage_client = storage.Client(credentials=credenciales, project=credenciales.project_id)
-
-# Nombre de tu bucket
-bucket_name = "angela-memoria.firebasestorage.app"
-bucket = storage_client.bucket(bucket_name)
-
-# -------------------------------
-# CREAR API
-# -------------------------------
-app = FastAPI(title="Angela Memoria", description="API para guardar y consultar memorias, estados y archivos")
-
-
-# -------------------------------
-# ENDPOINTS DE MEMORIA
-# -------------------------------
+# Guardar memoria
 @app.post("/guardar_memoria")
-def guardar_memoria(
-    origen: str = Form(...),
-    texto: str = Form(...),
-    categoria: str = Form("general"),
-    etiqueta: str = Form(None)
-):
-    """Guardar recuerdos en Firebase"""
-    data = {
-        "origen": origen,
+def guardar_memoria_post(texto: str = Form(...), etiqueta: str = Form("general")):
+    doc_ref = db.collection("Memoria").document()
+    doc_ref.set({
         "texto": texto,
-        "categoria": categoria,
-        "etiquetas": [etiqueta] if etiqueta else [],
-        "fecha": datetime.utcnow()
-    }
-    db.collection("Memoria").add(data)
+        "etiqueta": etiqueta,
+        "fecha": datetime.datetime.now()
+    })
     return {"mensaje": f"Memoria guardada: {texto}"}
 
-
-@app.get("/consultar_memorias/{etiqueta}")
-def consultar_memorias(etiqueta: str):
-    """Consultar recuerdos por etiqueta"""
-    docs = db.collection("Memoria").where("etiquetas", "array_contains", etiqueta).stream()
-    resultados = []
-    for doc in docs:
-        resultados.append(doc.to_dict())
-    return resultados
-
-
-# -------------------------------
-# ENDPOINTS DE ESTADOS
-# -------------------------------
+# Guardar estado
 @app.post("/guardar_estado")
-def guardar_estado(texto: str = Form(...)):
-    """Guardar estados de Angela"""
-    data = {
-        "texto": texto,
-        "fecha": datetime.utcnow()
-    }
-    db.collection("Estados").add(data)
-    return {"mensaje": f"Estado guardado: {texto}"}
+def guardar_estado_post(estado: str = Form(...)):
+    doc_ref = db.collection("Estados").document()
+    doc_ref.set({
+        "estado": estado,
+        "fecha": datetime.datetime.now()
+    })
+    return {"mensaje": f"Estado guardado: {estado}"}
 
-
-@app.get("/consultar_estados")
-def consultar_estados():
-    """Consultar estados guardados"""
-    docs = db.collection("Estados").stream()
-    resultados = [doc.to_dict() for doc in docs]
-    return resultados
-
-
-# -------------------------------
-# ENDPOINTS DE ARCHIVOS
-# -------------------------------
+# Subir archivo
 @app.post("/subir_archivo")
-def subir_archivo(file: UploadFile = File(...)):
-    """Subir archivos a Firebase Storage"""
+async def subir_archivo_post(file: UploadFile = File(...)):
     blob = bucket.blob(file.filename)
-    blob.upload_from_file(file.file, content_type=file.content_type)
+    blob.upload_from_file(file.file)
     blob.make_public()
 
-    data = {
+    doc_ref = db.collection("Archivos").document()
+    doc_ref.set({
         "nombre": file.filename,
+        "tipo": file.content_type,
         "url": blob.public_url,
-        "fecha": datetime.utcnow()
-    }
-    db.collection("Archivos").add(data)
+        "fecha": datetime.datetime.now()
+    })
 
     return {"mensaje": f"Archivo subido: {file.filename}", "url": blob.public_url}
-
-
-@app.get("/listar_archivos")
-def listar_archivos():
-    """Listar todos los archivos subidos"""
-    docs = db.collection("Archivos").stream()
-    resultados = [doc.to_dict() for doc in docs]
-    return resultados
-
-
-# -------------------------------
-# ROOT
-# -------------------------------
-@app.get("/")
-def root():
-    return {"mensaje": "Angela está lista para recordar, consultar y guardar archivos."}
