@@ -17,9 +17,11 @@ from firebase_admin import credentials, firestore, storage
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("angela_server")
 
-app = FastAPI(title="Angela Memoria API", version="1.2.0")
+app = FastAPI(title="Angela Memoria API", version="1.2.1")
 
-# CORS (ajusta si quieres restringir)
+# -----------------------------
+# CORS (ajusta si quieres)
+# -----------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,9 +30,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================
+# -----------------------------
 # Firebase bootstrapping
-# =========================
+# -----------------------------
 def _init_firebase_once():
     if firebase_admin._apps:
         return
@@ -45,6 +47,7 @@ def _init_firebase_once():
         raise RuntimeError("FIREBASE_KEY_JSON no contiene JSON válido.") from e
 
     project_id = key_dict.get("project_id")
+    # Inferimos bucket si no viene por variable:
     inferred_bucket = f"{project_id}.firebasestorage.app" if project_id else None
     bucket_name = os.getenv("FIREBASE_STORAGE_BUCKET") or inferred_bucket
     if not bucket_name:
@@ -62,6 +65,9 @@ def _db_bucket():
 def on_startup():
     _init_firebase_once()
 
+# -----------------------------
+# Endpoints base
+# -----------------------------
 @app.get("/")
 def root():
     return {"service": "Angela Memoria API", "status": "ok"}
@@ -70,12 +76,9 @@ def root():
 def health():
     return {"ok": True, "ts": datetime.datetime.utcnow().isoformat()}
 
-# =========================
+# -----------------------------
 # Utilidades
-# =========================
-def _read_all(upload: UploadFile) -> bytes:
-    return upload.file.read()  # FastAPI ya abre el stream
-
+# -----------------------------
 def _upload_bytes_to_storage(path: str, data: bytes, content_type: str) -> str:
     _, bucket = _db_bucket()
     blob = bucket.blob(path)
@@ -112,9 +115,9 @@ def _fmt_currency(amount: float) -> str:
     except Exception:
         return str(amount)
 
-# =========================
+# -----------------------------
 # Endpoints básicos
-# =========================
+# -----------------------------
 @app.post("/guardar_memoria")
 def guardar_memoria_post(texto: str = Form(...), etiqueta: str = Form("general")):
     db, _ = _db_bucket()
@@ -160,9 +163,9 @@ async def subir_archivo_post(file: UploadFile = File(...)):
     })
     return {"mensaje": f"Archivo subido: {filename}", "url": url}
 
-# =========================
-# WooCommerce Webhook
-# =========================
+# -----------------------------
+# WooCommerce Webhook + WhatsApp
+# -----------------------------
 WOO_BASE_URL = os.getenv("WOO_BASE_URL")  # ej: https://tu-dominio.com/wp-json/wc/v3
 WOO_CONSUMER_KEY = os.getenv("WOO_CONSUMER_KEY")
 WOO_CONSUMER_SECRET = os.getenv("WOO_CONSUMER_SECRET")
@@ -170,7 +173,7 @@ WOO_UPDATE_ON_HOLD = os.getenv("WOO_UPDATE_ON_HOLD", "0")  # "1" para activar
 
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")             # token WA Cloud API (opcional)
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")       # ej: 123456789012345 (opcional)
-WHATSAPP_NOTIFY_TO = os.getenv("WHATSAPP_NOTIFY_TO")     # número destino en formato internacional, ej: 57xxxxxxxxxx (opcional)
+WHATSAPP_NOTIFY_TO = os.getenv("WHATSAPP_NOTIFY_TO")     # número destino, ej: 57xxxxxxxxxx (opcional)
 
 def _update_woocommerce_status(order_id: int, status: str = "on-hold") -> Optional[dict]:
     if not (WOO_BASE_URL and WOO_CONSUMER_KEY and WOO_CONSUMER_SECRET):
@@ -217,15 +220,17 @@ async def webhook_woocommerce(request: Request):
     Recibe JSON de WooCommerce (pedido) y lo guarda en Firestore.
     Opcional:
       - Cambia estado del pedido a on-hold (WOO_UPDATE_ON_HOLD=1)
-      - Envia resumen por WhatsApp (si se configuran variables)
+      - Envía resumen por WhatsApp (si se configuran variables)
     """
     db, _ = _db_bucket()
     payload = await request.json()
+
+    # Campos básicos
     try:
         order_id = int(payload.get("id") or payload.get("order_id") or 0)
     except Exception:
         order_id = 0
-    number = payload.get("number") or str(order_id) or "N/A"
+    number = payload.get("number") or (str(order_id) if order_id else "N/A")
     status = payload.get("status") or "pending"
     currency = payload.get("currency") or "COP"
     total = float(payload.get("total") or 0.0)
@@ -237,7 +242,7 @@ async def webhook_woocommerce(request: Request):
     customer_email = billing.get("email") or ""
 
     line_items = payload.get("line_items") or []
-    items = []
+    items: List[Dict[str, Any]] = []
     for it in line_items:
         items.append({
             "name": it.get("name"),
@@ -249,14 +254,17 @@ async def webhook_woocommerce(request: Request):
             "total": float(it.get("total") or 0.0),
         })
 
-    # Fecha
+    # Fecha de creación del pedido
     created_raw = payload.get("date_created") or payload.get("date_created_gmt")
     try:
-        created_at = datetime.datetime.fromisoformat(created_raw.replace("Z", "+00:00")).replace(tzinfo=None) if created_raw else datetime.datetime.utcnow()
+        created_at = (
+            datetime.datetime.fromisoformat(created_raw.replace("Z", "+00:00")).replace(tzinfo=None)
+            if created_raw else datetime.datetime.utcnow()
+        )
     except Exception:
         created_at = datetime.datetime.utcnow()
 
-    # Guardar en Firestore
+    # Documento a guardar
     doc = {
         "order_id": order_id,
         "order_number": number,
@@ -273,4 +281,97 @@ async def webhook_woocommerce(request: Request):
         "items": items,
         "raw": payload,
         "source": "woocommerce",
-        "
+        "created_at": created_at,
+        "ingested_at": datetime.datetime.utcnow(),
+    }
+
+    doc_id = str(order_id) if order_id else firestore.AUTO_ID
+    db.collection("Pedidos").document(doc_id).set(doc)
+
+    # Opcionales
+    updated = None
+    if WOO_UPDATE_ON_HOLD == "1" and order_id:
+        updated = _update_woocommerce_status(order_id, "on-hold")
+
+    resumen = (
+        f"🧾 Nuevo pedido WooCommerce #{number}\n"
+        f"Cliente: {customer_name}\n"
+        f"Total: {currency} {_fmt_currency(total)}\n"
+        f"Items: " + ", ".join([f\"{i.get('name','')} x{i.get('quantity')}\" for i in items]) + "\n"
+        f"Estado: {status}"
+    )
+    wa_resp = _send_whatsapp_message(resumen)
+
+    return {
+        "ok": True,
+        "saved_doc": doc_id,
+        "whatsapp": bool(wa_resp),
+        "woo_status_updated": bool(updated),
+    }
+
+# -----------------------------
+# Reportes de ventas (CSV)
+# -----------------------------
+@app.get("/reportes/ventas")
+def reportes_ventas(
+    desde: str = Query(..., description="Fecha inicio (YYYY-MM-DD o ISO)"),
+    hasta: str = Query(..., description="Fecha fin (YYYY-MM-DD o ISO)"),
+    status: Optional[str] = Query(None, description="Filtrar por estado (opcional)"),
+):
+    """Genera un CSV con resumen de ventas y devuelve métricas + URL de descarga."""
+    db, _ = _db_bucket()
+    start_dt = _parse_iso_date(desde)
+    end_dt = _parse_iso_date(hasta, end_of_day=True)
+
+    q = db.collection("Pedidos").where("created_at", ">=", start_dt).where("created_at", "<=", end_dt)
+    if status:
+        q = q.where("status", "==", status)
+
+    docs = list(q.stream())
+    total_orders = len(docs)
+    total_amount = 0.0
+    prod_count: Dict[str, int] = {}
+    rows: List[List[Any]] = [["order_number", "fecha", "cliente", "estado", "total", "items"]]
+
+    for d in docs:
+        data = d.to_dict()
+        total = float(data.get("total") or 0.0)
+        total_amount += total
+        items = data.get("items") or []
+        item_str = "; ".join([f"{i.get('name','')} x{i.get('quantity')}" for i in items])
+        for i in items:
+            name = i.get("name") or "producto"
+            prod_count[name] = prod_count.get(name, 0) + int(i.get("quantity") or 0)
+        rows.append([
+            data.get("order_number"),
+            (data.get("created_at") or datetime.datetime.utcnow()).strftime("%Y-%m-%d %H:%M:%S"),
+            (data.get("customer") or {}).get("name", ""),
+            data.get("status", ""),
+            total,
+            item_str
+        ])
+
+    # CSV temporal y subida
+    with tempfile.NamedTemporaryFile(mode="w", newline="", delete=False, encoding="utf-8") as tmp:
+        writer = csv.writer(tmp)
+        writer.writerows(rows)
+        tmp.flush()
+        tmp_path = tmp.name
+
+    with open(tmp_path, "rb") as f:
+        csv_bytes = f.read()
+
+    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    csv_name = f"reportes/ventas_{timestamp}.csv"
+    url = _upload_bytes_to_storage(csv_name, csv_bytes, "text/csv")
+
+    top = sorted(prod_count.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    return {
+        "desde": start_dt.isoformat(),
+        "hasta": end_dt.isoformat(),
+        "total_orders": total_orders,
+        "total_amount": total_amount,
+        "top_products": [{"name": k, "qty": v} for k, v in top],
+        "csv_url": url
+    }
