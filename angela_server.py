@@ -7,7 +7,7 @@ import logging
 import tempfile
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Query
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 
 import requests
@@ -17,10 +17,10 @@ from firebase_admin import credentials, firestore, storage
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("angela_server")
 
-app = FastAPI(title="Angela Memoria API", version="1.2.2")
+app = FastAPI(title="Angela Memoria API", version="1.2.3")
 
 # -----------------------------
-# CORS (ajusta dominios si quieres)
+# CORS
 # -----------------------------
 app.add_middleware(
     CORSMiddleware,
@@ -86,9 +86,8 @@ def _upload_tempfile_to_storage(path: str, data: bytes, content_type: str) -> st
     return blob.public_url
 
 def _parse_iso_date(s: str, end_of_day: bool = False) -> datetime.datetime:
-    # Acepta "YYYY-MM-DD" o ISO completo
     try:
-        if len(s) == 10:  # YYYY-MM-DD
+        if len(s) == 10:
             dt = datetime.datetime.strptime(s, "%Y-%m-%d")
             if end_of_day:
                 dt = dt + datetime.timedelta(hours=23, minutes=59, seconds=59)
@@ -169,7 +168,7 @@ WOO_UPDATE_ON_HOLD = os.getenv("WOO_UPDATE_ON_HOLD", "0")  # "1" para activar
 
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")             # token WA Cloud API (opcional)
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")       # ej: 123456789012345 (opcional)
-WHATSAPP_NOTIFY_TO = os.getenv("WHATSAPP_NOTIFY_TO")     # número destino en formato internacional (opcional)
+WHATSAPP_NOTIFY_TO = os.getenv("WHATSAPP_NOTIFY_TO")     # número destino (opcional, formato 57xxxxxxxxxx)
 
 def _update_woocommerce_status(order_id: int, status: str = "on-hold") -> Optional[dict]:
     if not (WOO_BASE_URL and WOO_CONSUMER_KEY and WOO_CONSUMER_SECRET):
@@ -210,16 +209,40 @@ def _send_whatsapp_message(text: str) -> Optional[dict]:
         logger.warning(f"No se pudo enviar WhatsApp: {e}")
         return None
 
-@app.post("/webhook/woocommerce")
-async def webhook_woocommerce(request: Request):
-    """
-    Recibe JSON de WooCommerce (pedido) y lo guarda en Firestore.
-    Opcional:
-      - Cambia estado del pedido a on-hold (WOO_UPDATE_ON_HOLD=1)
-      - Envía resumen por WhatsApp (si se configuran variables)
-    """
+@app.post(
+    "/webhook/woocommerce",
+    summary="Webhook Woocommerce",
+    description=(
+        "Recibe JSON de WooCommerce (pedido) y lo guarda en Firestore. Opcional:\n"
+        "- Cambia estado del pedido a on-hold (WOO_UPDATE_ON_HOLD=1)\n"
+        "- Envía resumen por WhatsApp (si se configuran variables)"
+    ),
+)
+async def webhook_woocommerce(
+    payload: Dict[str, Any] = Body(
+        ...,
+        example={
+            "id": 12683868,
+            "number": "12683868",
+            "status": "processing",
+            "currency": "COP",
+            "total": "230000",
+            "date_created": "2025-08-28T14:05:00Z",
+            "billing": {
+                "first_name": "Juan",
+                "last_name": "Pérez",
+                "phone": "3000000000",
+                "email": "juan@example.com"
+            },
+            "shipping": {"address_1": "Calle 1 # 2-3", "city": "Medellín"},
+            "line_items": [
+                {"name": "Shampoo Yavalva", "sku": "SH-001", "product_id": 10, "quantity": 2, "price": "35000", "subtotal": "70000", "total": "70000"},
+                {"name": "Acondicionador", "sku": "AC-002", "product_id": 11, "quantity": 1, "price": "50000", "subtotal": "50000", "total": "50000"}
+            ]
+        }
+    )
+):
     db, _ = _db_bucket()
-    payload = await request.json()
 
     # Campos básicos
     try:
@@ -284,12 +307,11 @@ async def webhook_woocommerce(request: Request):
     doc_id = str(order_id) if order_id else firestore.AUTO_ID
     db.collection("Pedidos").document(doc_id).set(doc)
 
-    # Acciones opcionales
+    # Opcionales
     updated = None
     if WOO_UPDATE_ON_HOLD == "1" and order_id:
         updated = _update_woocommerce_status(order_id, "on-hold")
 
-    # Texto de WhatsApp (corregido sin escapes raros)
     items_str = ", ".join([f"{i.get('name','')} x{i.get('quantity')}" for i in items]) if items else "—"
     resumen = (
         f"🧾 Nuevo pedido WooCommerce #{number}\n"
@@ -349,7 +371,6 @@ def reportes_ventas(
             item_str
         ])
 
-    # CSV temporal y subida
     with tempfile.NamedTemporaryFile(mode="w", newline="", delete=False, encoding="utf-8") as tmp:
         writer = csv.writer(tmp)
         writer.writerows(rows)
