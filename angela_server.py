@@ -14,6 +14,10 @@ import requests
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
 
+# === WhatsApp helpers (desde whatsapp.py) ===
+# Asegúrate de tener whatsapp.py con send_template / send_text como vimos.
+from whatsapp import send_template, send_text
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("angela_server")
 
@@ -126,6 +130,10 @@ WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
 # Puede ser 1 o varios números separados por coma. Ej: "57XXXXXXXXXX,57YYYYYYYYY"
 WHATSAPP_NOTIFY_TO = os.getenv("WHATSAPP_NOTIFY_TO", "").strip()
 
+# Nombre/idioma de la plantilla (opcional — tienen defaults en whatsapp.py, pero aquí puedes forzar)
+WA_TEMPLATE_NAME = os.getenv("WA_TEMPLATE_NAME", "pedido_confirmado")
+WA_TEMPLATE_LANG = os.getenv("WA_TEMPLATE_LANG", "es_CO")
+
 def _send_whatsapp_message(text: str, to: Optional[str] = None) -> Optional[dict]:
     # Nota: WhatsApp Cloud API no envía a grupos; solo a números individuales.
     token = os.getenv("WHATSAPP_TOKEN")
@@ -163,6 +171,36 @@ def _send_whatsapp_to_all(text: str):
         num = raw.strip()
         if num:
             results.append(_send_whatsapp_message(text, num))
+    return results
+
+def _send_template_then_text_to_all(order_id: int, customer_name: str, total_fmt: str, wa_text: str):
+    """
+    Envía primero PLANTILLA (abre ventana 24h) y luego el texto largo de la empresa,
+    a cada número configurado en WHATSAPP_NOTIFY_TO.
+    """
+    if not WHATSAPP_NOTIFY_TO:
+        return []
+    results = []
+    for raw in WHATSAPP_NOTIFY_TO.split(","):
+        num = raw.strip()
+        if not num:
+            continue
+        try:
+            # 1) plantilla (usa nombre/idioma definidos)
+            r1 = send_template(num, order_id, customer_name, total_fmt,
+                               template_name=WA_TEMPLATE_NAME, language=WA_TEMPLATE_LANG)
+            results.append({"to": num, "template": r1})
+        except Exception as e:
+            logger.warning(f"Fallo enviando plantilla a {num}: {e}")
+            # seguimos con el intento de texto de todas formas
+
+        try:
+            # 2) texto interno con el layout completo
+            r2 = send_text(num, wa_text[:4096])
+            results.append({"to": num, "text": r2})
+        except Exception as e:
+            logger.warning(f"Fallo enviando texto a {num}: {e}")
+
     return results
 
 # -----------------------------
@@ -345,7 +383,7 @@ async def subir_archivo_post(file: UploadFile = File(...)):
     summary="Webhook Woocommerce",
     description=(
         "Recibe JSON de WooCommerce (pedido) y lo guarda en Firestore. "
-        "Opcional: cambia estado a on-hold (WOO_UPDATE_ON_HOLD=1) y envía texto a WhatsApp."
+        "Opcional: cambia estado a on-hold (WOO_UPDATE_ON_HOLD=1) y envía WhatsApp."
     ),
 )
 async def webhook_woocommerce(
@@ -422,10 +460,21 @@ async def webhook_woocommerce(
     if WOO_UPDATE_ON_HOLD == "1" and order_id:
         updated = _update_woocommerce_status(order_id, "on-hold")
 
-    # Opcional: enviar WhatsApp con el formato largo
-    wa_resp = None
+    # Envío a WhatsApp
+    wa_resp = []
     if WA_SEND_FORMATTED == "1":
-        wa_resp = _send_whatsapp_to_all(wa_text)
+        # Formato de total para la plantilla: $298.800
+        total_fmt_for_tpl = f"${_fmt_currency(total)}"
+
+        try:
+            # Primero PLANTILLA, luego texto largo (a todos los números configurados)
+            wa_resp = _send_template_then_text_to_all(order_id, customer_name, total_fmt_for_tpl, wa_text)
+            # Si no pudo nada, intenta fallback a solo texto
+            if not wa_resp:
+                wa_resp = _send_whatsapp_to_all(wa_text)
+        except Exception as e:
+            logger.warning(f"Error enviando plantilla+texto. Fallback a solo texto. Detalle: {e}")
+            wa_resp = _send_whatsapp_to_all(wa_text)
 
     return {
         "ok": True,
