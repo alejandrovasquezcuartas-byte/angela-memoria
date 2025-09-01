@@ -2,9 +2,9 @@
 import os
 import json
 import csv
+import hashlib
 import hmac
 import base64
-import hashlib
 import datetime
 import logging
 import tempfile
@@ -22,9 +22,7 @@ logger = logging.getLogger("angela_server")
 
 app = FastAPI(title="Angela Memoria API", version="1.4.0")
 
-# -----------------------------
-# CORS
-# -----------------------------
+# ----------------------------- CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,17 +31,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -----------------------------
-# Firebase bootstrapping
-# -----------------------------
+# ----------------------------- Firebase
 def _init_firebase_once():
     if firebase_admin._apps:
         return
-
     key_json = os.getenv("FIREBASE_KEY_JSON") or os.getenv("FIREBASE_KEY")
     if not key_json:
         raise RuntimeError("FIREBASE_KEY_JSON no está configurada en Environment.")
-
     try:
         key_dict = json.loads(key_json)
     except Exception as e:
@@ -67,9 +61,7 @@ def _db_bucket():
 def on_startup():
     _init_firebase_once()
 
-# -----------------------------
-# Utilidades
-# -----------------------------
+# ----------------------------- Utilidades
 def _upload_bytes_to_storage(path: str, data: bytes, content_type: str) -> str:
     _, bucket = _db_bucket()
     blob = bucket.blob(path)
@@ -118,9 +110,7 @@ def _get_meta_value(meta_list: List[Dict[str, Any]], keys: List[str]) -> Optiona
                 return str(val)
     return None
 
-# -----------------------------
-# WhatsApp (Cloud API)
-# -----------------------------
+# ----------------------------- WhatsApp
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
 WHATSAPP_NOTIFY_TO = os.getenv("WHATSAPP_NOTIFY_TO", "").strip()
@@ -131,7 +121,6 @@ def _send_whatsapp_message(text: str, to: Optional[str] = None) -> Optional[dict
     destino = (to or "").strip() or None
     if not destino and WHATSAPP_NOTIFY_TO:
         destino = WHATSAPP_NOTIFY_TO.split(",")[0].strip()
-
     if not (token and phone_id and destino):
         return None
     try:
@@ -145,7 +134,7 @@ def _send_whatsapp_message(text: str, to: Optional[str] = None) -> Optional[dict
         }
         r = requests.post(url, headers=headers, json=payload, timeout=20)
         if r.status_code >= 400:
-            logger.warning(f"WhatsApp API {r.status_code}: {r.text}")
+            logger.warning(f"WA error {r.status_code}: {r.text[:400]}")
         return r.json()
     except Exception as e:
         logger.warning(f"No se pudo enviar WhatsApp: {e}")
@@ -161,22 +150,12 @@ def _send_whatsapp_to_all(text: str):
             results.append(_send_whatsapp_message(text, num))
     return results
 
-# -----------------------------
-# WooCommerce config
-# -----------------------------
+# ----------------------------- Woo config
 WOO_BASE_URL = os.getenv("WOO_BASE_URL")
 WOO_CONSUMER_KEY = os.getenv("WOO_CONSUMER_KEY")
 WOO_CONSUMER_SECRET = os.getenv("WOO_CONSUMER_SECRET")
 WOO_UPDATE_ON_HOLD = os.getenv("WOO_UPDATE_ON_HOLD", "0")
 WA_SEND_FORMATTED = os.getenv("WA_SEND_FORMATTED", "1")
-
-# Seguridad webhook
-WC_WEBHOOK_SECRET = os.getenv("WC_WEBHOOK_SECRET", "")
-DEBUG_WEBHOOK = os.getenv("DEBUG_WEBHOOK", "0") == "1"
-
-# Dedupe ventana
-DEDUP_WINDOW = int(os.getenv("WA_DEDUP_WINDOW_SECS", "900"))
-_recent_orders_cache: Dict[str, float] = {}
 
 def _update_woocommerce_status(order_id: int, status: str = "on-hold") -> Optional[dict]:
     if not (WOO_BASE_URL and WOO_CONSUMER_KEY and WOO_CONSUMER_SECRET):
@@ -190,22 +169,20 @@ def _update_woocommerce_status(order_id: int, status: str = "on-hold") -> Option
             timeout=20
         )
         if resp.status_code >= 400:
-            logger.warning(f"Woo update status {resp.status_code}: {resp.text}")
+            logger.warning(f"Woo update status {resp.status_code}: {resp.text[:400]}")
         return resp.json()
     except Exception as e:
         logger.warning(f"No se pudo actualizar estado Woo: {e}")
         return None
 
-# -----------------------------
-# Formateo Yavalva para WhatsApp
-# -----------------------------
+# ----------------------------- Texto Yavalva
 def _extraer_cedula(payload: Dict[str, Any]) -> str:
     billing = payload.get("billing") or {}
-    for k in ["cedula", "dni", "document", "documento", "cc", "numero_documento", "nit"]:
+    for k in ["cedula", "dni", "document", "documento", "cc", "numero_documento", "nit", "billing_cc"]:
         val = billing.get(k)
         if val:
             return str(val)
-    meta = payload.get("meta_data") or payload.get("meta") or []
+    meta = payload.get("meta_data") or []
     val = _get_meta_value(meta, [
         "cedula", "dni", "document", "documento", "cc",
         "billing_cedula", "billing_dni", "numero_documento", "nit", "billing_cc"
@@ -220,22 +197,21 @@ def _fmt_yavalva_whatsapp(payload: Dict[str, Any]) -> str:
 
     addr1 = shipping.get("address_1") or billing.get("address_1") or ""
     addr2 = shipping.get("address_2") or billing.get("address_2") or ""
-    city  = shipping.get("city") or billing.get("city") or ""
+    city = shipping.get("city") or billing.get("city") or ""
     state = shipping.get("state") or billing.get("state") or ""
 
     email = billing.get("email") or ""
     phone = (billing.get("phone") or "").replace(" ", "")
     cedula = _extraer_cedula(payload)
-
-    # Línea de nota del cliente, si viene
     customer_note = (payload.get("customer_note") or "").strip()
 
     lines = []
     for it in (payload.get("line_items") or []):
         qty = int(it.get("quantity") or 1)
-        sku = it.get("sku") or it.get("name") or ""
+        sku = it.get("sku") or it.get("name") or it.get("product_id") or ""
         lines.append(f"{qty} {sku}")
-    if payload.get("shipping_lines"):
+    ship_lines = payload.get("shipping_lines") or []
+    if ship_lines:
         lines.append("1 envío")
 
     total_raw = payload.get("total") or "0"
@@ -256,75 +232,41 @@ def _fmt_yavalva_whatsapp(payload: Dict[str, Any]) -> str:
     if city:  parts.append(city)
     if state: parts.append(state)
     parts.append("")
-
     parts.append("Dirección de correo electrónico:")
     parts.append(email)
     parts.append("")
-
     parts.append("Teléfono:")
     parts.append(phone)
     parts.append("")
-
     parts.append("Cédula de Ciudadanía:")
-    parts.append(cedula)
+    parts.append(cedula if cedula else "(sin dato)")
     parts.append("")
-
     if customer_note:
         parts.append("Nota del cliente:")
         parts.append(customer_note)
         parts.append("")
-
     if lines:
         parts.extend(lines)
         parts.append("")
-
     parts.append(total_str)
     parts.append(pay_line)
-
     return "\n".join(parts).strip()
 
-# -----------------------------
-# Firma HMAC (Woo)
-# -----------------------------
-def _constant_time_equals(a: str, b: str) -> bool:
-    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
-
-def _verify_wc_signature(raw_body: bytes, headers: Dict[str, str]) -> bool:
-    """
-    Woo usa header 'X-WC-Webhook-Signature' con base64(HMAC_SHA256(body, secret)).
-    Aceptamos también 'X-Woocommerce-Signature' por compatibilidad.
-    """
-    provided = (
-        headers.get("x-wc-webhook-signature")
-        or headers.get("x-woocommerce-signature")
-        or ""
-    ).strip()
-
-    if not WC_WEBHOOK_SECRET:
-        # Si no hay secreto configurado, aceptamos (pero lo registramos).
-        logger.warning("WC_WEBHOOK_SECRET vacío; aceptando webhook sin verificación.")
-        return True
-
-    if not provided:
-        if DEBUG_WEBHOOK:
-            logger.warning("Webhook sin firma: header X-WC-Webhook-Signature no presente.")
+# ----------------------------- Idempotencia (anti duplicados)
+def _already_notified(db, key: str, window_secs: int) -> bool:
+    doc = db.collection("Notifications").document(key).get()
+    if not doc.exists:
         return False
+    data = doc.to_dict() or {}
+    ts = data.get("ts")
+    if not isinstance(ts, datetime.datetime):
+        return True
+    return (datetime.datetime.utcnow() - ts) < datetime.timedelta(seconds=window_secs)
 
-    expected = base64.b64encode(
-        hmac.new(WC_WEBHOOK_SECRET.encode("utf-8"), raw_body, hashlib.sha256).digest()
-    ).decode("utf-8")
+def _mark_notified(db, key: str):
+    db.collection("Notifications").document(key).set({"ts": datetime.datetime.utcnow()})
 
-    ok = _constant_time_equals(provided, expected)
-    if DEBUG_WEBHOOK and not ok:
-        # Log seguro (no mostramos el secreto). Mostramos primeras letras de la firma esperada.
-        logger.warning(
-            f"Firma inválida. Provided(len={len(provided)}), Expected(prefix)={expected[:8]}..., BodyLen={len(raw_body)}"
-        )
-    return ok
-
-# -----------------------------
-# Endpoints base
-# -----------------------------
+# ----------------------------- Endpoints base
 @app.get("/")
 def root():
     return {"service": "Angela Memoria API", "status": "ok"}
@@ -368,7 +310,6 @@ async def subir_archivo_post(file: UploadFile = File(...)):
         except Exception as e2:
             logger.exception(f"Error subiendo a Storage: {type(e2).__name__}: {e2}")
             raise HTTPException(status_code=500, detail=f"upload_error: {type(e2).__name__}: {e2}")
-
     db, _ = _db_bucket()
     db.collection("Archivos").document().set({
         "nombre": filename,
@@ -378,51 +319,69 @@ async def subir_archivo_post(file: UploadFile = File(...)):
     })
     return {"mensaje": f"Archivo subido: {filename}", "url": url}
 
-# -----------------------------
-# Webhook Woo + guardado + WhatsApp
-# -----------------------------
+# ----------------------------- Webhook Woo + guardado + WhatsApp
 @app.post("/webhook/woocommerce", summary="Webhook Woocommerce")
 async def webhook_woocommerce(request: Request):
-    raw_body = await request.body()
-
-    # Verificar HMAC
-    if not _verify_wc_signature(raw_body, request.headers):
-        raise HTTPException(status_code=401, detail="Invalid signature")
-
-    try:
-        payload: Dict[str, Any] = json.loads(raw_body.decode("utf-8"))
-    except Exception:
-        if DEBUG_WEBHOOK:
-            logger.exception("JSON inválido en webhook.")
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
     db, _ = _db_bucket()
 
-    # Básicos
+    # --- verificación HMAC (debug detallado)
+    secret = os.getenv("WC_WEBHOOK_SECRET", "")
+    allow_failopen = os.getenv("WC_WEBHOOK_ALLOW_FAILOPEN", "0") == "1"
+    raw = await request.body()
+    hdr_sig = request.headers.get("x-wc-webhook-signature", "") or request.headers.get("X-Wc-Webhook-Signature", "")
+    calc_sig = ""
+    if secret:
+        calc_sig = base64.b64encode(hmac.new(secret.encode("utf-8"), raw, hashlib.sha256).digest()).decode()
+        if not hdr_sig:
+            msg = "Falta x-wc-webhook-signature"
+            logger.warning(f"AUTH: {msg}")
+            if not allow_failopen:
+                raise HTTPException(status_code=401, detail=msg)
+        elif not hmac.compare_digest(hdr_sig, calc_sig):
+            logger.warning(f"AUTH mismatch hdr={hdr_sig[:10]}… calc={calc_sig[:10]}… len={len(raw)} bytes")
+            if not allow_failopen:
+                raise HTTPException(status_code=401, detail="Firma no válida")
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON inválido")
+
+    # --- deduplicación por (order_id + estado)
     try:
         order_id = int(payload.get("id") or payload.get("order_id") or 0)
     except Exception:
         order_id = 0
     number = str(payload.get("number") or (order_id if order_id else "")) or "N/A"
-    status = payload.get("status") or "pending"
+    status = (payload.get("status") or "").strip().lower() or "pending"
+
+    dd_window = int(os.getenv("WA_DEDUP_WINDOW_SECS", "900"))
+    dd_key = f"wa:{order_id}:{status}"
+    if _already_notified(db, dd_key, dd_window):
+        logger.info(f"Dedup skip {dd_key}")
+        return {"ok": True, "dedup": True}
+
+    # --- resto de campos
     currency = payload.get("currency") or "COP"
-    total = float(str(payload.get("total") or "0").replace(",", ".").replace(" ", ""))
+    try:
+        total = float(str(payload.get("total") or "0").replace(",", ".").replace(" ", ""))
+    except Exception:
+        total = 0.0
 
     billing = payload.get("billing") or {}
     shipping = payload.get("shipping") or {}
     customer_name = f"{billing.get('first_name','')} {billing.get('last_name','')}".strip() or billing.get("company") or "N/A"
 
-    line_items = payload.get("line_items") or []
     items: List[Dict[str, Any]] = []
-    for it in line_items:
+    for it in (payload.get("line_items") or []):
         items.append({
             "name": it.get("name"),
             "sku": it.get("sku"),
             "product_id": it.get("product_id"),
             "quantity": it.get("quantity"),
-            "price": float(str(it.get("price") or "0").replace(",", ".")) if it.get("price") is not None else None,
-            "subtotal": float(str(it.get("subtotal") or "0").replace(",", ".")) if it.get("subtotal") is not None else None,
-            "total": float(str(it.get("total") or "0").replace(",", ".")) if it.get("total") is not None else None,
+            "price": float(str(it.get("price") or "0").replace(",", ".")),
+            "subtotal": float(str(it.get("subtotal") or "0").replace(",", ".")),
+            "total": float(str(it.get("total") or "0").replace(",", ".")),
         })
 
     created_raw = payload.get("date_created") or payload.get("date_created_gmt") or payload.get("created")
@@ -434,18 +393,7 @@ async def webhook_woocommerce(request: Request):
     except Exception:
         created_at = datetime.datetime.utcnow()
 
-    # Texto para WhatsApp (con cédula + nota si aplica)
     wa_text = _fmt_yavalva_whatsapp(payload)
-
-    # Dedupe por ventana temporal
-    now_ts = datetime.datetime.utcnow().timestamp()
-    key = f"{order_id}:{status}"
-    last_ts = _recent_orders_cache.get(key, 0)
-    if now_ts - last_ts < DEDUP_WINDOW:
-        logger.info(f"Deduplicado pedido {key}; ignorado dentro de {DEDUP_WINDOW}s.")
-        return {"ok": True, "dedup": True}
-
-    _recent_orders_cache[key] = now_ts
 
     doc = {
         "order_id": order_id,
@@ -467,7 +415,6 @@ async def webhook_woocommerce(request: Request):
         "created_at": created_at,
         "ingested_at": datetime.datetime.utcnow(),
     }
-
     doc_id = str(order_id) if order_id else firestore.AUTO_ID
     db.collection("Pedidos").document(doc_id).set(doc)
 
@@ -478,18 +425,21 @@ async def webhook_woocommerce(request: Request):
     wa_resp = None
     if os.getenv("WA_SEND_FORMATTED", "1") == "1":
         wa_resp = _send_whatsapp_to_all(wa_text)
+        _mark_notified(db, dd_key)
 
     return {
         "ok": True,
         "saved_doc": doc_id,
         "whatsapp_sent": bool(wa_resp),
         "woo_status_updated": bool(updated),
-        "dedup": False,
+        "auth_debug": {
+            "have_secret": bool(secret),
+            "hdr_sig_10": (hdr_sig[:10] if hdr_sig else ""),
+            "calc_sig_10": (calc_sig[:10] if calc_sig else "")
+        }
     }
 
-# -----------------------------
-# Texto WhatsApp para copiar/pegar
-# -----------------------------
+# ----------------------------- Texto para copiar
 @app.get("/pedido/{order_number}/whatsapp_text")
 def whatsapp_text(order_number: str):
     db, _ = _db_bucket()
@@ -497,34 +447,13 @@ def whatsapp_text(order_number: str):
     if doc_ref.exists:
         data = doc_ref.to_dict()
         return {"order_number": order_number, "text": data.get("wa_text", "")}
-
     docs = list(db.collection("Pedidos").where("order_number", "==", order_number).limit(1).stream())
     if docs:
         data = docs[0].to_dict()
         return {"order_number": order_number, "text": data.get("wa_text", "")}
     raise HTTPException(status_code=404, detail="Pedido no encontrado")
 
-@app.get("/pedidos/whatsapp_texts")
-def whatsapp_texts(
-    desde: str = Query(..., description="YYYY-MM-DD o ISO"),
-    hasta: str = Query(..., description="YYYY-MM-DD o ISO"),
-    limit: int = Query(10, ge=1, le=100),
-):
-    db, _ = _db_bucket()
-    start_dt = _parse_iso_date(desde)
-    end_dt = _parse_iso_date(hasta, end_of_day=True)
-    q = db.collection("Pedidos").where("created_at", ">=", start_dt).where("created_at", "<=", end_dt).order_by("created_at")
-    out = []
-    for d in q.stream():
-        data = d.to_dict()
-        out.append({"order_number": data.get("order_number"), "text": data.get("wa_text", "")})
-        if len(out) >= limit:
-            break
-    return {"desde": start_dt.isoformat(), "hasta": end_dt.isoformat(), "results": out}
-
-# -----------------------------
-# Reportes de ventas (CSV)
-# -----------------------------
+# ----------------------------- Reporte CSV
 @app.get("/reportes/ventas")
 def reportes_ventas(
     desde: str = Query(..., description="Fecha inicio (YYYY-MM-DD o ISO)"),
@@ -564,8 +493,7 @@ def reportes_ventas(
         ])
 
     with tempfile.NamedTemporaryFile(mode="w", newline="", delete=False, encoding="utf-8") as tmp:
-        writer = csv.writer(tmp)
-        writer.writerows(rows)
+        csv.writer(tmp).writerows(rows)
         tmp.flush()
         tmp_path = tmp.name
 
@@ -577,7 +505,6 @@ def reportes_ventas(
     url = _upload_bytes_to_storage(csv_name, csv_bytes, "text/csv")
 
     top = sorted(prod_count.items(), key=lambda x: x[1], reverse=True)[:10]
-
     return {
         "desde": start_dt.isoformat(),
         "hasta": end_dt.isoformat(),
