@@ -15,13 +15,12 @@ import firebase_admin
 from firebase_admin import credentials, firestore, storage
 
 # === WhatsApp helpers (desde whatsapp.py) ===
-# Asegúrate de tener whatsapp.py con send_template / send_text como vimos.
 from whatsapp import send_template, send_text
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("angela_server")
 
-app = FastAPI(title="Angela Memoria API", version="1.3.0")
+app = FastAPI(title="Angela Memoria API", version="1.3.1")
 
 # -----------------------------
 # CORS
@@ -114,11 +113,10 @@ def _get_meta_value(meta_list: List[Dict[str, Any]], keys: List[str]) -> Optiona
         if k in keys:
             val = m.get("value")
             if isinstance(val, dict):
-                # algunos plugins guardan diccionarios
                 for vv in val.values():
                     if vv:
                         return str(vv)
-            if val:
+            if val is not None:
                 return str(val)
     return None
 
@@ -130,20 +128,16 @@ WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
 # Puede ser 1 o varios números separados por coma. Ej: "57XXXXXXXXXX,57YYYYYYYYY"
 WHATSAPP_NOTIFY_TO = os.getenv("WHATSAPP_NOTIFY_TO", "").strip()
 
-# Nombre/idioma de la plantilla (opcional — tienen defaults en whatsapp.py, pero aquí puedes forzar)
+# Nombre/idioma de la plantilla (opcional)
 WA_TEMPLATE_NAME = os.getenv("WA_TEMPLATE_NAME", "pedido_confirmado")
 WA_TEMPLATE_LANG = os.getenv("WA_TEMPLATE_LANG", "es_CO")
 
 def _send_whatsapp_message(text: str, to: Optional[str] = None) -> Optional[dict]:
-    # Nota: WhatsApp Cloud API no envía a grupos; solo a números individuales.
     token = os.getenv("WHATSAPP_TOKEN")
     phone_id = os.getenv("WHATSAPP_PHONE_ID")
     destino = (to or "").strip() or None
-    if not destino:
-        # Si no se pasa, usa el primer número de la variable global
-        if WHATSAPP_NOTIFY_TO:
-            destino = WHATSAPP_NOTIFY_TO.split(",")[0].strip()
-
+    if not destino and WHATSAPP_NOTIFY_TO:
+        destino = WHATSAPP_NOTIFY_TO.split(",")[0].strip()
     if not (token and phone_id and destino):
         return None
     try:
@@ -186,21 +180,16 @@ def _send_template_then_text_to_all(order_id: int, customer_name: str, total_fmt
         if not num:
             continue
         try:
-            # 1) plantilla (usa nombre/idioma definidos)
             r1 = send_template(num, order_id, customer_name, total_fmt,
                                template_name=WA_TEMPLATE_NAME, language=WA_TEMPLATE_LANG)
             results.append({"to": num, "template": r1})
         except Exception as e:
             logger.warning(f"Fallo enviando plantilla a {num}: {e}")
-            # seguimos con el intento de texto de todas formas
-
         try:
-            # 2) texto interno con el layout completo
             r2 = send_text(num, wa_text[:4096])
             results.append({"to": num, "text": r2})
         except Exception as e:
             logger.warning(f"Fallo enviando texto a {num}: {e}")
-
     return results
 
 # -----------------------------
@@ -234,17 +223,27 @@ def _update_woocommerce_status(order_id: int, status: str = "on-hold") -> Option
 # Formateo Yavalva para WhatsApp
 # -----------------------------
 def _extraer_cedula(payload: Dict[str, Any]) -> str:
+    """
+    Intenta obtener la cédula desde:
+      - billing: cedula/dni/document/cc/... (por si algún plugin la pone allí)
+      - meta_data: incluye soporte explícito para 'billing_cc' (como en tu Woo)
+    """
     billing = payload.get("billing") or {}
-    # intentos directos
-    for k in ["cedula", "dni", "document", "documento", "cc", "numero_documento", "nit"]:
+    # directos en billing
+    for k in [
+        "cedula", "dni", "document", "documento", "cc", "numero_documento", "nit",
+        "billing_cc", "billing_cedula", "billing_dni"
+    ]:
         val = billing.get(k)
         if val:
             return str(val)
+
     # meta_data
     meta = payload.get("meta_data") or []
     val = _get_meta_value(meta, [
-        "cedula", "dni", "document", "documento", "cc",
-        "billing_cedula", "billing_dni", "numero_documento", "nit"
+        "billing_cc", "cedula", "dni", "document", "documento", "cc",
+        "billing_cedula", "billing_dni", "numero_documento", "nit",
+        "customer_document", "document_number", "cedula_ciudadania"
     ])
     return str(val) if val else ""
 
@@ -256,7 +255,6 @@ def _fmt_yavalva_whatsapp(payload: Dict[str, Any]) -> str:
 
     addr1 = shipping.get("address_1") or billing.get("address_1") or ""
     addr2 = shipping.get("address_2") or billing.get("address_2") or ""
-    # En tus ejemplos se listan ciudad y departamento/lugar en líneas separadas
     city = shipping.get("city") or billing.get("city") or ""
     state = shipping.get("state") or billing.get("state") or ""
 
@@ -264,7 +262,10 @@ def _fmt_yavalva_whatsapp(payload: Dict[str, Any]) -> str:
     phone = (billing.get("phone") or "").replace(" ", "")
     cedula = _extraer_cedula(payload)
 
-    # Items (prefiere SKU, cae al nombre si no existe)
+    # Nota del cliente (Woo: customer_note)
+    customer_note = (payload.get("customer_note") or "").strip()
+
+    # Items
     lines = []
     for it in (payload.get("line_items") or []):
         qty = int(it.get("quantity") or 1)
@@ -280,14 +281,13 @@ def _fmt_yavalva_whatsapp(payload: Dict[str, Any]) -> str:
     try:
         total = float(total_raw)
     except Exception:
-        # a veces viene str con coma/puntos
         total = float(str(total_raw).replace(".", "").replace(",", "."))
     total_str = _fmt_currency(total)
 
     pay_title = payload.get("payment_method_title") or payload.get("payment_method") or ""
     pay_line = f"{pay_title} - web".strip()
 
-    # Construcción con saltos exactos como tus ejemplos
+    # Construcción
     parts = []
     parts.append(f"Pedido {number}")
     if customer_name: parts.append(customer_name)
@@ -306,17 +306,22 @@ def _fmt_yavalva_whatsapp(payload: Dict[str, Any]) -> str:
     parts.append("")
 
     parts.append("Cédula de Ciudadanía:")
-    parts.append(cedula)
+    parts.append(cedula if cedula else "")
     parts.append("")
 
     if lines:
         parts.extend(lines)
         parts.append("")
 
+    # Nota del cliente (si viene)
+    if customer_note:
+        parts.append("Nota del cliente:")
+        parts.append(customer_note)
+        parts.append("")
+
     parts.append(total_str)
     parts.append(pay_line)
 
-    # Unión con saltos de línea
     return "\n".join(parts).strip()
 
 # -----------------------------
@@ -463,13 +468,9 @@ async def webhook_woocommerce(
     # Envío a WhatsApp
     wa_resp = []
     if WA_SEND_FORMATTED == "1":
-        # Formato de total para la plantilla: $298.800
         total_fmt_for_tpl = f"${_fmt_currency(total)}"
-
         try:
-            # Primero PLANTILLA, luego texto largo (a todos los números configurados)
             wa_resp = _send_template_then_text_to_all(order_id, customer_name, total_fmt_for_tpl, wa_text)
-            # Si no pudo nada, intenta fallback a solo texto
             if not wa_resp:
                 wa_resp = _send_whatsapp_to_all(wa_text)
         except Exception as e:
@@ -490,13 +491,11 @@ async def webhook_woocommerce(
 def whatsapp_text(order_number: str):
     """Devuelve el texto formateado (Yavalva) de un pedido para copiar/pegar."""
     db, _ = _db_bucket()
-    # primero intenta por doc id
     doc_ref = db.collection("Pedidos").document(order_number).get()
     if doc_ref.exists:
         data = doc_ref.to_dict()
         return {"order_number": order_number, "text": data.get("wa_text", "")}
 
-    # si no existe, busca por campo order_number
     docs = list(db.collection("Pedidos").where("order_number", "==", order_number).limit(1).stream())
     if docs:
         data = docs[0].to_dict()
