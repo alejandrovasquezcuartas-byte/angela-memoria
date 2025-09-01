@@ -14,13 +14,10 @@ import requests
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
 
-# === WhatsApp helpers (desde whatsapp.py) ===
-from whatsapp import send_template, send_text
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("angela_server")
 
-app = FastAPI(title="Angela Memoria API", version="1.3.1")
+app = FastAPI(title="Angela Memoria API", version="1.4.0")
 
 # -----------------------------
 # CORS
@@ -116,7 +113,7 @@ def _get_meta_value(meta_list: List[Dict[str, Any]], keys: List[str]) -> Optiona
                 for vv in val.values():
                     if vv:
                         return str(vv)
-            if val is not None:
+            if val:
                 return str(val)
     return None
 
@@ -125,77 +122,111 @@ def _get_meta_value(meta_list: List[Dict[str, Any]], keys: List[str]) -> Optiona
 # -----------------------------
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
-# Puede ser 1 o varios números separados por coma. Ej: "57XXXXXXXXXX,57YYYYYYYYY"
+# Uno o varios números separados por coma, sin '+', ej: "573001112233,573224445566"
 WHATSAPP_NOTIFY_TO = os.getenv("WHATSAPP_NOTIFY_TO", "").strip()
 
-# Nombre/idioma de la plantilla (opcional)
-WA_TEMPLATE_NAME = os.getenv("WA_TEMPLATE_NAME", "pedido_confirmado")
-WA_TEMPLATE_LANG = os.getenv("WA_TEMPLATE_LANG", "es_CO")
+# Plantillas
+WA_TEMPLATE_NAME = os.getenv("WA_TEMPLATE_NAME", "pedido_resumen").strip()
+# Ojo: si tu plantilla no tiene traducción a es_CO, usa 'es'
+WA_TEMPLATE_LANG = os.getenv("WA_TEMPLATE_LANG", "es").strip()
 
-def _send_whatsapp_message(text: str, to: Optional[str] = None) -> Optional[dict]:
-    token = os.getenv("WHATSAPP_TOKEN")
-    phone_id = os.getenv("WHATSAPP_PHONE_ID")
-    destino = (to or "").strip() or None
-    if not destino and WHATSAPP_NOTIFY_TO:
-        destino = WHATSAPP_NOTIFY_TO.split(",")[0].strip()
-    if not (token and phone_id and destino):
+def _normalize_recipients(raw: str) -> List[str]:
+    if not raw:
+        return []
+    out = []
+    for piece in raw.replace(" ", "").split(","):
+        if piece:
+            out.append(piece)
+    # quitar duplicados preservando orden
+    seen = set()
+    unique = []
+    for n in out:
+        if n not in seen:
+            seen.add(n)
+            unique.append(n)
+    return unique
+
+def _send_whatsapp_text(text: str, to: str) -> Optional[dict]:
+    if not (WHATSAPP_TOKEN and WHATSAPP_PHONE_ID and to):
         return None
     try:
-        url = f"https://graph.facebook.com/v19.0/{phone_id}/messages"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        url = f"https://graph.facebook.com/v20.0/{WHATSAPP_PHONE_ID}/messages"
+        headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
         payload = {
             "messaging_product": "whatsapp",
-            "to": destino,
+            "to": to,
             "type": "text",
             "text": {"body": text[:4096]},
         }
         r = requests.post(url, headers=headers, json=payload, timeout=20)
         if r.status_code >= 400:
-            logger.warning(f"WhatsApp API {r.status_code}: {r.text}")
+            logger.warning(f"WA -> text {r.status_code}: {r.text}")
         return r.json()
     except Exception as e:
-        logger.warning(f"No se pudo enviar WhatsApp: {e}")
+        logger.warning(f"WA text error: {e}")
         return None
 
-def _send_whatsapp_to_all(text: str):
-    if not (WHATSAPP_TOKEN and WHATSAPP_PHONE_ID and WHATSAPP_NOTIFY_TO):
-        return []
+def _send_text_to_all(text: str) -> List[Optional[dict]]:
     results = []
-    for raw in WHATSAPP_NOTIFY_TO.split(","):
-        num = raw.strip()
-        if num:
-            results.append(_send_whatsapp_message(text, num))
+    for num in _normalize_recipients(WHATSAPP_NOTIFY_TO):
+        results.append(_send_whatsapp_text(text, num))
     return results
 
-def _send_template_then_text_to_all(order_id: int, customer_name: str, total_fmt: str, wa_text: str):
-    """
-    Envía primero PLANTILLA (abre ventana 24h) y luego el texto largo de la empresa,
-    a cada número configurado en WHATSAPP_NOTIFY_TO.
-    """
-    if not WHATSAPP_NOTIFY_TO:
-        return []
-    results = []
-    for raw in WHATSAPP_NOTIFY_TO.split(","):
-        num = raw.strip()
-        if not num:
-            continue
-        try:
-            r1 = send_template(num, order_id, customer_name, total_fmt,
-                               template_name=WA_TEMPLATE_NAME, language=WA_TEMPLATE_LANG)
-            results.append({"to": num, "template": r1})
-        except Exception as e:
-            logger.warning(f"Fallo enviando plantilla a {num}: {e}")
-        try:
-            r2 = send_text(num, wa_text[:4096])
-            results.append({"to": num, "text": r2})
-        except Exception as e:
-            logger.warning(f"Fallo enviando texto a {num}: {e}")
+def _send_whatsapp_template(to: str, order_id: str, customer_name: str, total_str: str) -> Optional[dict]:
+    """Envía la plantilla (3 parámetros: pedido, nombre, total)."""
+    if not (WHATSAPP_TOKEN and WHATSAPP_PHONE_ID and to and WA_TEMPLATE_NAME and WA_TEMPLATE_LANG):
+        return None
+    try:
+        url = f"https://graph.facebook.com/v20.0/{WHATSAPP_PHONE_ID}/messages"
+        headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "template",
+            "template": {
+                "name": WA_TEMPLATE_NAME,
+                "language": {"code": WA_TEMPLATE_LANG},
+                "components": [{
+                    "type": "body",
+                    "parameters": [
+                        {"type": "text", "text": str(order_id)},
+                        {"type": "text", "text": customer_name},
+                        {"type": "text", "text": total_str},
+                    ],
+                }],
+            },
+        }
+        r = requests.post(url, headers=headers, json=payload, timeout=20)
+        if r.status_code >= 400:
+            logger.warning(f"WA -> template {r.status_code}: {r.text}")
+        return r.json()
+    except Exception as e:
+        logger.warning(f"WA template error: {e}")
+        return None
+
+def _send_template_then_text_to_all(order_id: str, customer_name: str, total_str: str, long_text: str) -> Dict[str, Any]:
+    """Primero envía la plantilla; luego el texto largo. Si la plantilla falla, envía igual el texto."""
+    results = {"template": [], "text": []}
+    recipients = _normalize_recipients(WHATSAPP_NOTIFY_TO)
+    if not recipients:
+        return results
+
+    # Enviar plantilla (best effort)
+    for num in recipients:
+        tpl_resp = _send_whatsapp_template(num, order_id, customer_name, total_str)
+        results["template"].append(tpl_resp)
+
+    # Siempre enviar el texto largo
+    for num in recipients:
+        txt_resp = _send_whatsapp_text(long_text, num)
+        results["text"].append(txt_resp)
+
     return results
 
 # -----------------------------
 # WooCommerce config
 # -----------------------------
-WOO_BASE_URL = os.getenv("WOO_BASE_URL")  # ej: https://yavalva.com.co/wp-json/wc/v3
+WOO_BASE_URL = os.getenv("WOO_BASE_URL")  # ej: https://tusitio.com/wp-json/wc/v3
 WOO_CONSUMER_KEY = os.getenv("WOO_CONSUMER_KEY")
 WOO_CONSUMER_SECRET = os.getenv("WOO_CONSUMER_SECRET")
 WOO_UPDATE_ON_HOLD = os.getenv("WOO_UPDATE_ON_HOLD", "0")  # "1" para activar
@@ -223,27 +254,20 @@ def _update_woocommerce_status(order_id: int, status: str = "on-hold") -> Option
 # Formateo Yavalva para WhatsApp
 # -----------------------------
 def _extraer_cedula(payload: Dict[str, Any]) -> str:
-    """
-    Intenta obtener la cédula desde:
-      - billing: cedula/dni/document/cc/... (por si algún plugin la pone allí)
-      - meta_data: incluye soporte explícito para 'billing_cc' (como en tu Woo)
-    """
     billing = payload.get("billing") or {}
-    # directos en billing
-    for k in [
-        "cedula", "dni", "document", "documento", "cc", "numero_documento", "nit",
-        "billing_cc", "billing_cedula", "billing_dni"
-    ]:
-        val = billing.get(k)
-        if val:
-            return str(val)
+    shipping = payload.get("shipping") or {}
+    # 1) directos
+    for k in ["cedula", "dni", "document", "documento", "cc", "nit", "billing_cc"]:
+        v = billing.get(k) or shipping.get(k)
+        if v:
+            return str(v)
 
-    # meta_data
+    # 2) meta_data
     meta = payload.get("meta_data") or []
     val = _get_meta_value(meta, [
-        "billing_cc", "cedula", "dni", "document", "documento", "cc",
-        "billing_cedula", "billing_dni", "numero_documento", "nit",
-        "customer_document", "document_number", "cedula_ciudadania"
+        "cedula", "dni", "document", "documento", "cc", "nit",
+        "billing_cc", "billing_cedula", "billing_dni", "numero_documento",
+        "shipping_cc", "shipping_cedula", "shipping_dni"
     ])
     return str(val) if val else ""
 
@@ -255,25 +279,20 @@ def _fmt_yavalva_whatsapp(payload: Dict[str, Any]) -> str:
 
     addr1 = shipping.get("address_1") or billing.get("address_1") or ""
     addr2 = shipping.get("address_2") or billing.get("address_2") or ""
-    city = shipping.get("city") or billing.get("city") or ""
-    state = shipping.get("state") or billing.get("state") or ""
+    city  = shipping.get("city")      or billing.get("city")      or ""
+    state = shipping.get("state")     or billing.get("state")     or ""
 
     email = billing.get("email") or ""
     phone = (billing.get("phone") or "").replace(" ", "")
     cedula = _extraer_cedula(payload)
 
-    # Nota del cliente (Woo: customer_note)
-    customer_note = (payload.get("customer_note") or "").strip()
-
-    # Items
+    # Ítems
     lines = []
     for it in (payload.get("line_items") or []):
         qty = int(it.get("quantity") or 1)
         sku = it.get("sku") or it.get("name") or ""
         lines.append(f"{qty} {sku}")
-    # Shipping lines como "1 envío"
-    ship_lines = payload.get("shipping_lines") or []
-    if ship_lines:
+    if payload.get("shipping_lines"):
         lines.append("1 envío")
 
     # Total
@@ -287,7 +306,9 @@ def _fmt_yavalva_whatsapp(payload: Dict[str, Any]) -> str:
     pay_title = payload.get("payment_method_title") or payload.get("payment_method") or ""
     pay_line = f"{pay_title} - web".strip()
 
-    # Construcción
+    # Nota del cliente
+    customer_note = (payload.get("customer_note") or "").strip()
+
     parts = []
     parts.append(f"Pedido {number}")
     if customer_name: parts.append(customer_name)
@@ -295,7 +316,7 @@ def _fmt_yavalva_whatsapp(payload: Dict[str, Any]) -> str:
     if addr2: parts.append(addr2)
     if city:  parts.append(city)
     if state: parts.append(state)
-    parts.append("")  # línea en blanco
+    parts.append("")
 
     parts.append("Dirección de correo electrónico:")
     parts.append(email)
@@ -306,14 +327,13 @@ def _fmt_yavalva_whatsapp(payload: Dict[str, Any]) -> str:
     parts.append("")
 
     parts.append("Cédula de Ciudadanía:")
-    parts.append(cedula if cedula else "")
+    parts.append(cedula)
     parts.append("")
 
     if lines:
         parts.extend(lines)
         parts.append("")
 
-    # Nota del cliente (si viene)
     if customer_note:
         parts.append("Nota del cliente:")
         parts.append(customer_note)
@@ -388,7 +408,8 @@ async def subir_archivo_post(file: UploadFile = File(...)):
     summary="Webhook Woocommerce",
     description=(
         "Recibe JSON de WooCommerce (pedido) y lo guarda en Firestore. "
-        "Opcional: cambia estado a on-hold (WOO_UPDATE_ON_HOLD=1) y envía WhatsApp."
+        "Opcional: cambia estado a on-hold (WOO_UPDATE_ON_HOLD=1). "
+        "Siempre intenta enviar plantilla y, si WA_SEND_FORMATTED=1, también envía el texto largo."
     ),
 )
 async def webhook_woocommerce(
@@ -404,7 +425,10 @@ async def webhook_woocommerce(
     number = str(payload.get("number") or (order_id if order_id else "")) or "N/A"
     status = payload.get("status") or "pending"
     currency = payload.get("currency") or "COP"
-    total = float(str(payload.get("total") or "0").replace(",", ".").replace(" ", ""))
+    try:
+        total = float(str(payload.get("total") or "0").replace(",", ".").replace(" ", ""))
+    except Exception:
+        total = 0.0
 
     billing = payload.get("billing") or {}
     shipping = payload.get("shipping") or {}
@@ -434,6 +458,7 @@ async def webhook_woocommerce(
 
     # Texto formateado para WhatsApp (estilo Yavalva)
     wa_text = _fmt_yavalva_whatsapp(payload)
+    total_str = _fmt_currency(total)
 
     # Documento a guardar
     doc = {
@@ -465,22 +490,20 @@ async def webhook_woocommerce(
     if WOO_UPDATE_ON_HOLD == "1" and order_id:
         updated = _update_woocommerce_status(order_id, "on-hold")
 
-    # Envío a WhatsApp
-    wa_resp = []
-    if WA_SEND_FORMATTED == "1":
-        total_fmt_for_tpl = f"${_fmt_currency(total)}"
-        try:
-            wa_resp = _send_template_then_text_to_all(order_id, customer_name, total_fmt_for_tpl, wa_text)
-            if not wa_resp:
-                wa_resp = _send_whatsapp_to_all(wa_text)
-        except Exception as e:
-            logger.warning(f"Error enviando plantilla+texto. Fallback a solo texto. Detalle: {e}")
-            wa_resp = _send_whatsapp_to_all(wa_text)
+    # WhatsApp: plantilla + (opcional) texto
+    wa_resp = {}
+    try:
+        wa_resp["send"] = _send_template_then_text_to_all(
+            order_id=number, customer_name=customer_name, total_str=total_str,
+            long_text=wa_text if WA_SEND_FORMATTED == "1" else ""
+        )
+    except Exception as e:
+        logger.warning(f"WA send error: {e}")
 
     return {
         "ok": True,
         "saved_doc": doc_id,
-        "whatsapp_sent": bool(wa_resp),
+        "whatsapp_attempted": True,
         "woo_status_updated": bool(updated),
     }
 
@@ -491,11 +514,13 @@ async def webhook_woocommerce(
 def whatsapp_text(order_number: str):
     """Devuelve el texto formateado (Yavalva) de un pedido para copiar/pegar."""
     db, _ = _db_bucket()
+    # primero intenta por doc id
     doc_ref = db.collection("Pedidos").document(order_number).get()
     if doc_ref.exists:
         data = doc_ref.to_dict()
         return {"order_number": order_number, "text": data.get("wa_text", "")}
 
+    # si no existe, busca por campo order_number
     docs = list(db.collection("Pedidos").where("order_number", "==", order_number).limit(1).stream())
     if docs:
         data = docs[0].to_dict()
