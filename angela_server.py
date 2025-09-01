@@ -18,7 +18,7 @@ from firebase_admin import credentials, firestore, storage
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("angela_server")
 
-app = FastAPI(title="Angela Memoria API", version="1.4.0")
+app = FastAPI(title="Angela Memoria API", version="1.4.1")
 
 # ----------------------------- CORS -----------------------------
 app.add_middleware(
@@ -167,14 +167,19 @@ def _update_woocommerce_status(order_id: int, status: str = "on-hold") -> Option
 # ------------- Formateo estilo Yavalva (texto WA) ---------------
 def _extraer_cedula(payload: Dict[str, Any]) -> str:
     billing = payload.get("billing") or {}
-    for k in ["cedula", "dni", "document", "documento", "cc", "numero_documento", "nit", "billing_cedula"]:
+    # claves directas más comunes (incluye billing_cc)
+    for k in [
+        "cedula", "dni", "document", "documento", "cc",
+        "numero_documento", "nit", "billing_cedula", "billing_cc"
+    ]:
         val = billing.get(k)
         if val:
             return str(val)
+    # en meta_data (incluye billing_cc)
     meta = payload.get("meta_data") or []
     val = _get_meta_value(meta, [
         "cedula", "dni", "document", "documento", "cc",
-        "billing_cedula", "billing_dni", "numero_documento", "nit"
+        "billing_cedula", "billing_dni", "numero_documento", "nit", "billing_cc"
     ])
     return str(val) if val else ""
 
