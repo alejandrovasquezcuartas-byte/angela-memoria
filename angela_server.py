@@ -20,7 +20,7 @@ from firebase_admin import credentials, firestore, storage
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("angela_server")
 
-app = FastAPI(title="Angela Memoria API", version="1.4.0")
+app = FastAPI(title="Angela Memoria API", version="1.4.1")
 
 # ----------------------------- CORS
 app.add_middleware(
@@ -193,7 +193,7 @@ def _fmt_yavalva_whatsapp(payload: Dict[str, Any]) -> str:
     number = str(payload.get("number") or payload.get("id") or "")
     billing = payload.get("billing") or {}
     shipping = payload.get("shipping") or {}
-    customer_name = f"{billing.get('first_name','')} {billing.get('last_name','')}".strip() or billing.get("company","")
+    customer_name = f"{billing.get("first_name","")} {billing.get("last_name","")}".strip() or billing.get("company","")
 
     addr1 = shipping.get("address_1") or billing.get("address_1") or ""
     addr2 = shipping.get("address_2") or billing.get("address_2") or ""
@@ -254,16 +254,27 @@ def _fmt_yavalva_whatsapp(payload: Dict[str, Any]) -> str:
 
 # ----------------------------- Idempotencia (anti duplicados)
 def _already_notified(db, key: str, window_secs: int) -> bool:
+    """Devuelve True si ya se notificó ese key dentro de la ventana.
+
+    Normaliza cualquier datetime con zona horaria a naive UTC para evitar
+    errores del tipo "can't subtract offset-naive and offset-aware datetimes".
+    """
     doc = db.collection("Notifications").document(key).get()
     if not doc.exists:
         return False
     data = doc.to_dict() or {}
     ts = data.get("ts")
     if not isinstance(ts, datetime.datetime):
+        # Si el dato es raro, por seguridad consideramos que ya fue notificado
         return True
-    return (datetime.datetime.utcnow() - ts) < datetime.timedelta(seconds=window_secs)
+    # Normalizar a naive UTC
+    if ts.tzinfo is not None and ts.tzinfo.utcoffset(ts) is not None:
+        ts = ts.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    now = datetime.datetime.utcnow()
+    return (now - ts) < datetime.timedelta(seconds=window_secs)
 
 def _mark_notified(db, key: str):
+    """Marca una notificación con timestamp en UTC naive (compatible con _already_notified)."""
     db.collection("Notifications").document(key).set({"ts": datetime.datetime.utcnow()})
 
 # ----------------------------- Endpoints base
@@ -347,7 +358,7 @@ async def webhook_woocommerce(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="JSON inválido")
 
-    # --- deduplicación por (order_id + estado)
+    # --- deduplicación por pedido + estado
     try:
         order_id = int(payload.get("id") or payload.get("order_id") or 0)
     except Exception:
@@ -355,10 +366,12 @@ async def webhook_woocommerce(request: Request):
     number = str(payload.get("number") or (order_id if order_id else "")) or "N/A"
     status = (payload.get("status") or "").strip().lower() or "pending"
 
-    dd_window = int(os.getenv("WA_DEDUP_WINDOW_SECS", "900"))
-    dd_key = f"wa:{order_id}:{status}"
-    if _already_notified(db, dd_key, dd_window):
-        logger.info(f"Dedup skip {dd_key}")
+    # Ventana de desduplicación: por defecto 24h para evitar mensajes duplicados
+    dd_window = int(os.getenv("WA_DEDUP_WINDOW_SECS", "86400"))
+    dd_key_order = f"wa:{order_id}"
+    dd_key_status = f"wa:{order_id}:{status}"
+    if _already_notified(db, dd_key_order, dd_window) or _already_notified(db, dd_key_status, dd_window):
+        logger.info(f"Dedup skip {dd_key_order}/{dd_key_status}")
         return {"ok": True, "dedup": True}
 
     # --- resto de campos
@@ -370,7 +383,7 @@ async def webhook_woocommerce(request: Request):
 
     billing = payload.get("billing") or {}
     shipping = payload.get("shipping") or {}
-    customer_name = f"{billing.get('first_name','')} {billing.get('last_name','')}".strip() or billing.get("company") or "N/A"
+    customer_name = f"{billing.get("first_name","")} {billing.get("last_name","")}".strip() or billing.get("company") or "N/A"
 
     items: List[Dict[str, Any]] = []
     for it in (payload.get("line_items") or []):
@@ -425,7 +438,8 @@ async def webhook_woocommerce(request: Request):
     wa_resp = None
     if os.getenv("WA_SEND_FORMATTED", "1") == "1":
         wa_resp = _send_whatsapp_to_all(wa_text)
-        _mark_notified(db, dd_key)
+        _mark_notified(db, dd_key_order)
+        _mark_notified(db, dd_key_status)
 
     return {
         "ok": True,
