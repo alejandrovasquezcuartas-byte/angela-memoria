@@ -540,4 +540,3 @@ def reportes_ventas(
         "top_products": [{"name": k, "qty": v} for k, v in top],
         "csv_url": url
     }
-
