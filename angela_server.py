@@ -20,7 +20,7 @@ from firebase_admin import credentials, firestore, storage
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("angela_server")
 
-app = FastAPI(title="Angela Memoria API", version="1.4.2")
+app = FastAPI(title="Angela Memoria API", version="1.5.0")
 
 # ----------------------------- CORS
 app.add_middleware(
@@ -205,7 +205,7 @@ def _fmt_yavalva_whatsapp(payload: Dict[str, Any]) -> str:
     cedula = _extraer_cedula(payload)
     customer_note = (payload.get("customer_note") or "").strip()
 
-    lines = []
+    lines: List[str] = []
     for it in (payload.get("line_items") or []):
         qty = int(it.get("quantity") or 1)
         sku = it.get("sku") or it.get("name") or it.get("product_id") or ""
@@ -257,34 +257,28 @@ def _fmt_yavalva_whatsapp(payload: Dict[str, Any]) -> str:
     parts.append(pay_line)
     return "\n".join(parts).strip()
 
-# ----------------------------- Idempotencia (anti duplicados)
+# ----------------------------- Idempotencia
 def _normalize_ts(ts: datetime.datetime) -> datetime.datetime:
-    """Normaliza cualquier datetime (naive o aware) a naive UTC."""
-    if not isinstance(ts, datetime.datetime):
-        raise TypeError("ts no es datetime")
     if ts.tzinfo is not None and ts.tzinfo.utcoffset(ts) is not None:
         ts = ts.astimezone(datetime.timezone.utc).replace(tzinfo=None)
     return ts
 
 def _already_notified(db, key: str, window_secs: int) -> bool:
-    """Devuelve True si ya se notificó ese key dentro de la ventana."""
     doc = db.collection("Notifications").document(key).get()
     if not doc.exists:
         return False
     data = doc.to_dict() or {}
     ts = data.get("ts")
     if not isinstance(ts, datetime.datetime):
-        # Si el dato es raro, por seguridad consideramos que ya fue notificado
         return True
     try:
-        ts_norm = _normalize_ts(ts)
+        ts = _normalize_ts(ts)
     except Exception:
         return True
     now = datetime.datetime.utcnow()
-    return (now - ts_norm) < datetime.timedelta(seconds=window_secs)
+    return (now - ts) < datetime.timedelta(seconds=window_secs)
 
 def _mark_notified(db, key: str):
-    """Marca una notificación con timestamp en UTC naive (compatible con _already_notified)."""
     db.collection("Notifications").document(key).set({"ts": datetime.datetime.utcnow()})
 
 # ----------------------------- Endpoints base
@@ -340,12 +334,11 @@ async def subir_archivo_post(file: UploadFile = File(...)):
     })
     return {"mensaje": f"Archivo subido: {filename}", "url": url}
 
-# ----------------------------- Webhook Woo + guardado + WhatsApp
+# ----------------------------- Webhook Woo
 @app.post("/webhook/woocommerce", summary="Webhook Woocommerce")
 async def webhook_woocommerce(request: Request):
     db, _ = _db_bucket()
 
-    # --- verificación HMAC (debug detallado)
     secret = os.getenv("WC_WEBHOOK_SECRET", "")
     allow_failopen = os.getenv("WC_WEBHOOK_ALLOW_FAILOPEN", "0") == "1"
     raw = await request.body()
@@ -368,7 +361,6 @@ async def webhook_woocommerce(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="JSON inválido")
 
-    # --- datos básicos
     try:
         order_id = int(payload.get("id") or payload.get("order_id") or 0)
     except Exception:
@@ -376,21 +368,19 @@ async def webhook_woocommerce(request: Request):
     number = str(payload.get("number") or (order_id if order_id else "")) or "N/A"
     status = (payload.get("status") or "").strip().lower() or "pending"
 
-    # --- configurar qué estados cuentan como "compra real"
-    paid_default = "processing,completed,transaccion-aprobada,procesando,transacción aprobada"
+    # estados considerados "compra real"
+    paid_default = "processing,completed,transaccion-aprobada,wc-transaccion-aprobada"
     paid_cfg = os.getenv("WA_PAID_STATUSES", paid_default)
     paid_like_statuses = {s.strip().lower() for s in paid_cfg.split(",") if s.strip()}
     is_paid_like = status in paid_like_statuses
 
-    # --- deduplicación solo para pedidos "pagados"
-    dd_window = int(os.getenv("WA_DEDUP_WINDOW_SECS", "86400"))  # 24h por defecto
-    dd_key_order = f"wa:{order_id}"
-    dd_key_status = f"wa:{order_id}:{status}"
-    if is_paid_like and (_already_notified(db, dd_key_order, dd_window) or _already_notified(db, dd_key_status, dd_window)):
-        logger.info(f"Dedup skip {dd_key_order}/{dd_key_status}")
-        return {"ok": True, "dedup": True, "skipped_reason": "duplicate_paid_order"}
+    # dedupe por (order_id + status) SOLO para estados de compra
+    dd_window = int(os.getenv("WA_DEDUP_WINDOW_SECS", "900"))
+    dd_key = f"wa:{order_id}:{status}"
+    if is_paid_like and _already_notified(db, dd_key, dd_window):
+        logger.info(f"Dedup skip {dd_key}")
+        return {"ok": True, "dedup": True, "skipped_reason": "duplicate_paid_status"}
 
-    # --- resto de campos
     currency = payload.get("currency") or "COP"
     try:
         total = float(str(payload.get("total") or "0").replace(",", ".").replace(" ", ""))
@@ -458,8 +448,7 @@ async def webhook_woocommerce(request: Request):
     wa_resp = None
     if is_paid_like and os.getenv("WA_SEND_FORMATTED", "1") == "1":
         wa_resp = _send_whatsapp_to_all(wa_text)
-        _mark_notified(db, dd_key_order)
-        _mark_notified(db, dd_key_status)
+        _mark_notified(db, dd_key)
     elif not is_paid_like:
         logger.info(f"WA skip for order {order_id} status={status} (no es estado de compra)")
 
