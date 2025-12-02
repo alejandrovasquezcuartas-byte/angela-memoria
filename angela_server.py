@@ -10,7 +10,7 @@ import logging
 import tempfile
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Body, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 import requests
@@ -20,7 +20,7 @@ from firebase_admin import credentials, firestore, storage
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("angela_server")
 
-app = FastAPI(title="Angela Memoria API", version="1.4.1")
+app = FastAPI(title="Angela Memoria API", version="1.4.2")
 
 # ----------------------------- CORS
 app.add_middleware(
@@ -193,7 +193,7 @@ def _fmt_yavalva_whatsapp(payload: Dict[str, Any]) -> str:
     number = str(payload.get("number") or payload.get("id") or "")
     billing = payload.get("billing") or {}
     shipping = payload.get("shipping") or {}
-    customer_name = f"{billing.get("first_name","")} {billing.get("last_name","")}".strip() or billing.get("company","")
+    customer_name = f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip() or billing.get("company", "")
 
     addr1 = shipping.get("address_1") or billing.get("address_1") or ""
     addr2 = shipping.get("address_2") or billing.get("address_2") or ""
@@ -224,13 +224,18 @@ def _fmt_yavalva_whatsapp(payload: Dict[str, Any]) -> str:
     pay_title = payload.get("payment_method_title") or payload.get("payment_method") or ""
     pay_line = f"{pay_title} - web".strip()
 
-    parts = []
+    parts: List[str] = []
     parts.append(f"Pedido {number}")
-    if customer_name: parts.append(customer_name)
-    if addr1: parts.append(addr1)
-    if addr2: parts.append(addr2)
-    if city:  parts.append(city)
-    if state: parts.append(state)
+    if customer_name:
+        parts.append(customer_name)
+    if addr1:
+        parts.append(addr1)
+    if addr2:
+        parts.append(addr2)
+    if city:
+        parts.append(city)
+    if state:
+        parts.append(state)
     parts.append("")
     parts.append("Dirección de correo electrónico:")
     parts.append(email)
@@ -253,12 +258,16 @@ def _fmt_yavalva_whatsapp(payload: Dict[str, Any]) -> str:
     return "\n".join(parts).strip()
 
 # ----------------------------- Idempotencia (anti duplicados)
-def _already_notified(db, key: str, window_secs: int) -> bool:
-    """Devuelve True si ya se notificó ese key dentro de la ventana.
+def _normalize_ts(ts: datetime.datetime) -> datetime.datetime:
+    """Normaliza cualquier datetime (naive o aware) a naive UTC."""
+    if not isinstance(ts, datetime.datetime):
+        raise TypeError("ts no es datetime")
+    if ts.tzinfo is not None and ts.tzinfo.utcoffset(ts) is not None:
+        ts = ts.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return ts
 
-    Normaliza cualquier datetime con zona horaria a naive UTC para evitar
-    errores del tipo "can't subtract offset-naive and offset-aware datetimes".
-    """
+def _already_notified(db, key: str, window_secs: int) -> bool:
+    """Devuelve True si ya se notificó ese key dentro de la ventana."""
     doc = db.collection("Notifications").document(key).get()
     if not doc.exists:
         return False
@@ -267,11 +276,12 @@ def _already_notified(db, key: str, window_secs: int) -> bool:
     if not isinstance(ts, datetime.datetime):
         # Si el dato es raro, por seguridad consideramos que ya fue notificado
         return True
-    # Normalizar a naive UTC
-    if ts.tzinfo is not None and ts.tzinfo.utcoffset(ts) is not None:
-        ts = ts.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    try:
+        ts_norm = _normalize_ts(ts)
+    except Exception:
+        return True
     now = datetime.datetime.utcnow()
-    return (now - ts) < datetime.timedelta(seconds=window_secs)
+    return (now - ts_norm) < datetime.timedelta(seconds=window_secs)
 
 def _mark_notified(db, key: str):
     """Marca una notificación con timestamp en UTC naive (compatible con _already_notified)."""
@@ -358,7 +368,7 @@ async def webhook_woocommerce(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="JSON inválido")
 
-    # --- deduplicación por pedido + estado
+    # --- datos básicos
     try:
         order_id = int(payload.get("id") or payload.get("order_id") or 0)
     except Exception:
@@ -366,13 +376,19 @@ async def webhook_woocommerce(request: Request):
     number = str(payload.get("number") or (order_id if order_id else "")) or "N/A"
     status = (payload.get("status") or "").strip().lower() or "pending"
 
-    # Ventana de desduplicación: por defecto 24h para evitar mensajes duplicados
-    dd_window = int(os.getenv("WA_DEDUP_WINDOW_SECS", "86400"))
+    # --- configurar qué estados cuentan como "compra real"
+    paid_default = "processing,completed,transaccion-aprobada,procesando,transacción aprobada"
+    paid_cfg = os.getenv("WA_PAID_STATUSES", paid_default)
+    paid_like_statuses = {s.strip().lower() for s in paid_cfg.split(",") if s.strip()}
+    is_paid_like = status in paid_like_statuses
+
+    # --- deduplicación solo para pedidos "pagados"
+    dd_window = int(os.getenv("WA_DEDUP_WINDOW_SECS", "86400"))  # 24h por defecto
     dd_key_order = f"wa:{order_id}"
     dd_key_status = f"wa:{order_id}:{status}"
-    if _already_notified(db, dd_key_order, dd_window) or _already_notified(db, dd_key_status, dd_window):
+    if is_paid_like and (_already_notified(db, dd_key_order, dd_window) or _already_notified(db, dd_key_status, dd_window)):
         logger.info(f"Dedup skip {dd_key_order}/{dd_key_status}")
-        return {"ok": True, "dedup": True}
+        return {"ok": True, "dedup": True, "skipped_reason": "duplicate_paid_order"}
 
     # --- resto de campos
     currency = payload.get("currency") or "COP"
@@ -383,18 +399,21 @@ async def webhook_woocommerce(request: Request):
 
     billing = payload.get("billing") or {}
     shipping = payload.get("shipping") or {}
-    customer_name = f"{billing.get("first_name","")} {billing.get("last_name","")}".strip() or billing.get("company") or "N/A"
+    customer_name = f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip() or billing.get("company") or "N/A"
 
     items: List[Dict[str, Any]] = []
     for it in (payload.get("line_items") or []):
+        try_price = str(it.get("price") or "0").replace(",", ".")
+        try_sub = str(it.get("subtotal") or "0").replace(",", ".")
+        try_tot = str(it.get("total") or "0").replace(",", ".")
         items.append({
             "name": it.get("name"),
             "sku": it.get("sku"),
             "product_id": it.get("product_id"),
             "quantity": it.get("quantity"),
-            "price": float(str(it.get("price") or "0").replace(",", ".")),
-            "subtotal": float(str(it.get("subtotal") or "0").replace(",", ".")),
-            "total": float(str(it.get("total") or "0").replace(",", ".")),
+            "price": float(try_price),
+            "subtotal": float(try_sub),
+            "total": float(try_tot),
         })
 
     created_raw = payload.get("date_created") or payload.get("date_created_gmt") or payload.get("created")
@@ -427,24 +446,28 @@ async def webhook_woocommerce(request: Request):
         "source": "woocommerce",
         "created_at": created_at,
         "ingested_at": datetime.datetime.utcnow(),
+        "paid_like": is_paid_like,
     }
     doc_id = str(order_id) if order_id else firestore.AUTO_ID
     db.collection("Pedidos").document(doc_id).set(doc)
 
     updated = None
-    if os.getenv("WOO_UPDATE_ON_HOLD", "0") == "1" and order_id:
+    if is_paid_like and os.getenv("WOO_UPDATE_ON_HOLD", "0") == "1" and order_id:
         updated = _update_woocommerce_status(order_id, "on-hold")
 
     wa_resp = None
-    if os.getenv("WA_SEND_FORMATTED", "1") == "1":
+    if is_paid_like and os.getenv("WA_SEND_FORMATTED", "1") == "1":
         wa_resp = _send_whatsapp_to_all(wa_text)
         _mark_notified(db, dd_key_order)
         _mark_notified(db, dd_key_status)
+    elif not is_paid_like:
+        logger.info(f"WA skip for order {order_id} status={status} (no es estado de compra)")
 
     return {
         "ok": True,
         "saved_doc": doc_id,
         "whatsapp_sent": bool(wa_resp),
+        "paid_like": is_paid_like,
         "woo_status_updated": bool(updated),
         "auth_debug": {
             "have_secret": bool(secret),
@@ -507,7 +530,8 @@ def reportes_ventas(
         ])
 
     with tempfile.NamedTemporaryFile(mode="w", newline="", delete=False, encoding="utf-8") as tmp:
-        csv.writer(tmp).writerows(rows)
+        writer = csv.writer(tmp)
+        writer.writerows(rows)
         tmp.flush()
         tmp_path = tmp.name
 
@@ -527,3 +551,4 @@ def reportes_ventas(
         "top_products": [{"name": k, "qty": v} for k, v in top],
         "csv_url": url
     }
+
