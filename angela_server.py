@@ -20,7 +20,10 @@ from firebase_admin import credentials, firestore, storage
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("angela_server")
 
-app = FastAPI(title="Angela Memoria API", version="1.5.0")
+app = FastAPI(title="Angela Memoria API", version="1.5.1")
+
+# Flag de debug detallado para webhooks
+DEBUG_WEBHOOK = os.getenv("DEBUG_WEBHOOK", "0") == "1"
 
 # ----------------------------- CORS
 app.add_middleware(
@@ -122,6 +125,7 @@ def _send_whatsapp_message(text: str, to: Optional[str] = None) -> Optional[dict
     if not destino and WHATSAPP_NOTIFY_TO:
         destino = WHATSAPP_NOTIFY_TO.split(",")[0].strip()
     if not (token and phone_id and destino):
+        logger.warning("WA: faltan credenciales o número destino.")
         return None
     try:
         url = f"https://graph.facebook.com/v19.0/{phone_id}/messages"
@@ -142,6 +146,7 @@ def _send_whatsapp_message(text: str, to: Optional[str] = None) -> Optional[dict
 
 def _send_whatsapp_to_all(text: str):
     if not (WHATSAPP_TOKEN and WHATSAPP_PHONE_ID and WHATSAPP_NOTIFY_TO):
+        logger.warning("WA: configuración incompleta, no se enviará a ningún número.")
         return []
     results = []
     for raw in WHATSAPP_NOTIFY_TO.split(","):
@@ -175,6 +180,28 @@ def _update_woocommerce_status(order_id: int, status: str = "on-hold") -> Option
         logger.warning(f"No se pudo actualizar estado Woo: {e}")
         return None
 
+def _add_woocommerce_note(order_id: int, note: str) -> Optional[dict]:
+    """
+    Agrega una nota interna al pedido en WooCommerce para marcar que Angela lo procesó.
+    """
+    if not (WOO_BASE_URL and WOO_CONSUMER_KEY and WOO_CONSUMER_SECRET and order_id):
+        return None
+    try:
+        url = f"{WOO_BASE_URL}/orders/{order_id}/notes"
+        payload = {"note": note, "customer_note": False}
+        resp = requests.post(
+            url,
+            params={"consumer_key": WOO_CONSUMER_KEY, "consumer_secret": WOO_CONSUMER_SECRET},
+            json=payload,
+            timeout=20
+        )
+        if resp.status_code >= 400:
+            logger.warning(f"Woo add note {resp.status_code}: {resp.text[:400]}")
+        return resp.json()
+    except Exception as e:
+        logger.warning(f"No se pudo agregar nota en Woo: {e}")
+        return None
+
 # ----------------------------- Texto Yavalva
 def _extraer_cedula(payload: Dict[str, Any]) -> str:
     billing = payload.get("billing") or {}
@@ -193,7 +220,7 @@ def _fmt_yavalva_whatsapp(payload: Dict[str, Any]) -> str:
     number = str(payload.get("number") or payload.get("id") or "")
     billing = payload.get("billing") or {}
     shipping = payload.get("shipping") or {}
-    customer_name = f"{billing.get('first_name', '')} {billing.get('last_name', '')}".strip() or billing.get("company", "")
+    customer_name = f"{billing.get("first_name", "")} {billing.get("last_name", "")}".strip() or billing.get("company", "")
 
     addr1 = shipping.get("address_1") or billing.get("address_1") or ""
     addr2 = shipping.get("address_2") or billing.get("address_2") or ""
@@ -264,6 +291,8 @@ def _normalize_ts(ts: datetime.datetime) -> datetime.datetime:
     return ts
 
 def _already_notified(db, key: str, window_secs: int) -> bool:
+    if window_secs <= 0:
+        return False
     doc = db.collection("Notifications").document(key).get()
     if not doc.exists:
         return False
@@ -288,7 +317,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "ts": datetime.datetime.utcnow().isoformat()}
+    return {"ok": True, "ts": datetime.datetime.utcnow().isoformat(), "version": "1.5.1"}
 
 @app.post("/guardar_memoria")
 def guardar_memoria_post(texto: str = Form(...), etiqueta: str = Form("general")):
@@ -378,8 +407,12 @@ async def webhook_woocommerce(request: Request):
     dd_window = int(os.getenv("WA_DEDUP_WINDOW_SECS", "900"))
     dd_key = f"wa:{order_id}:{status}"
     if is_paid_like and _already_notified(db, dd_key, dd_window):
-        logger.info(f"Dedup skip {dd_key}")
+        if DEBUG_WEBHOOK:
+            logger.info(f"[WEBHOOK] Dedup skip {dd_key} (order_id={order_id}, status={status})")
         return {"ok": True, "dedup": True, "skipped_reason": "duplicate_paid_status"}
+
+    if DEBUG_WEBHOOK:
+        logger.info(f"[WEBHOOK] order_id={order_id} number={number} status={status} paid_like={is_paid_like} dd_key={dd_key}")
 
     currency = payload.get("currency") or "COP"
     try:
@@ -417,6 +450,37 @@ async def webhook_woocommerce(request: Request):
 
     wa_text = _fmt_yavalva_whatsapp(payload)
 
+    # --- WhatsApp & Woo updates
+    updated = None
+    wa_resp = None
+
+    if is_paid_like and order_id and os.getenv("WOO_UPDATE_ON_HOLD", "0") == "1":
+        updated = _update_woocommerce_status(order_id, "on-hold")
+
+    can_send_wa = (
+        is_paid_like
+        and os.getenv("WA_SEND_FORMATTED", "1") == "1"
+        and WHATSAPP_TOKEN
+        and WHATSAPP_PHONE_ID
+        and WHATSAPP_NOTIFY_TO
+    )
+
+    if can_send_wa:
+        wa_resp = _send_whatsapp_to_all(wa_text)
+        _mark_notified(db, dd_key)
+        if is_paid_like and order_id and wa_resp:
+            # marcamos el pedido en Woo con una nota interna
+            note_ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            note_txt = f"Angela: pedido enviado a WhatsApp el {note_ts} UTC"
+            _add_woocommerce_note(order_id, note_txt)
+    elif is_paid_like:
+        logger.warning("WA: Pedido de compra pero configuración incompleta, no se envía WhatsApp.")
+    else:
+        if DEBUG_WEBHOOK:
+            logger.info(f"[WEBHOOK] WA skip for order {order_id} status={status} (no es estado de compra)")
+
+    whatsapp_sent = bool(wa_resp)
+
     doc = {
         "order_id": order_id,
         "order_number": number,
@@ -437,25 +501,15 @@ async def webhook_woocommerce(request: Request):
         "created_at": created_at,
         "ingested_at": datetime.datetime.utcnow(),
         "paid_like": is_paid_like,
+        "whatsapp_sent": whatsapp_sent,
     }
     doc_id = str(order_id) if order_id else firestore.AUTO_ID
     db.collection("Pedidos").document(doc_id).set(doc)
 
-    updated = None
-    if is_paid_like and os.getenv("WOO_UPDATE_ON_HOLD", "0") == "1" and order_id:
-        updated = _update_woocommerce_status(order_id, "on-hold")
-
-    wa_resp = None
-    if is_paid_like and os.getenv("WA_SEND_FORMATTED", "1") == "1":
-        wa_resp = _send_whatsapp_to_all(wa_text)
-        _mark_notified(db, dd_key)
-    elif not is_paid_like:
-        logger.info(f"WA skip for order {order_id} status={status} (no es estado de compra)")
-
     return {
         "ok": True,
         "saved_doc": doc_id,
-        "whatsapp_sent": bool(wa_resp),
+        "whatsapp_sent": whatsapp_sent,
         "paid_like": is_paid_like,
         "woo_status_updated": bool(updated),
         "auth_debug": {
@@ -540,3 +594,4 @@ def reportes_ventas(
         "top_products": [{"name": k, "qty": v} for k, v in top],
         "csv_url": url
     }
+
